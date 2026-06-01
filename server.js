@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['*'] }));
 app.use(express.json());
+app.use((req,res,next) => { console.log('REQ HEADERS:', JSON.stringify(req.headers)); next(); });
 
 const PORT = process.env.PORT || 3000;
 const MCP_API_KEY = process.env.MCP_SHARED_API_KEY || 'changeme';
