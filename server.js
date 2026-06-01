@@ -5,7 +5,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 
 const app = express();
-app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['*'] }));
+app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS','DELETE'], allowedHeaders: ['*'] }));
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
@@ -142,43 +142,23 @@ async function callTool(name, args) {
   throw new Error(`Unknown tool: ${name}`);
 }
 
-function jsonrpcError(id, code, message) {
-  return { jsonrpc: '2.0', id: id !== undefined ? id : null, error: { code, message } };
+function sendJsonRpc(res, data) {
+  res.setHeader('Content-Type', 'application/json');
+  res.json(data);
 }
 
-app.post('/mcp', async (req, res) => {
-  const key = getApiKey(req);
-  if (key !== MCP_API_KEY) {
-    console.log('AUTH REJECTED - key mismatch. Received:', key ? key.substring(0,8)+'...' : 'none');
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  const body = req.body;
-  console.log('MCP request body:', JSON.stringify(body).substring(0, 200));
-
-  // Handle batch requests
-  if (Array.isArray(body)) {
-    const results = [];
-    for (const msg of body) {
-      const r = await handleMessage(msg);
-      if (r !== null) results.push(r);
-    }
-    return res.json(results);
-  }
-
-  const result = await handleMessage(body);
-  if (result === null) {
-    // Notification - no response body
-    return res.status(204).send();
-  }
-  return res.json(result);
-});
+function sendSse(res, data) {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+  res.end();
+}
 
 async function handleMessage(msg) {
-  const { jsonrpc, id, method, params } = msg;
+  const { id, method, params } = msg;
   console.log('MCP method:', method, '| id:', id);
 
-  // Notifications have no id - return null (no response)
   const isNotification = id === undefined || id === null;
 
   try {
@@ -194,8 +174,8 @@ async function handleMessage(msg) {
       };
     }
 
-    if (method === 'notifications/initialized' || (method && method.startsWith('notifications/'))) {
-      return null; // No response for notifications
+    if (method && method.startsWith('notifications/')) {
+      return null;
     }
 
     if (method === 'tools/list') {
@@ -205,11 +185,10 @@ async function handleMessage(msg) {
     if (method === 'tools/call') {
       const toolName = params && params.name;
       const toolArgs = (params && params.arguments) || {};
-      console.log('Calling tool:', toolName, 'with args:', JSON.stringify(toolArgs));
+      console.log('Calling tool:', toolName, 'args:', JSON.stringify(toolArgs));
       const data = await callTool(toolName, toolArgs);
       return {
-        jsonrpc: '2.0',
-        id,
+        jsonrpc: '2.0', id,
         result: {
           content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
           isError: false
@@ -221,14 +200,63 @@ async function handleMessage(msg) {
       return { jsonrpc: '2.0', id, result: {} };
     }
 
-    return jsonrpcError(id, -32601, `Method not found: ${method}`);
+    return { jsonrpc: '2.0', id: id !== undefined ? id : null, error: { code: -32601, message: `Method not found: ${method}` } };
 
   } catch (err) {
     console.error('Handler error:', err.message);
     if (isNotification) return null;
-    return jsonrpcError(id, -32000, err.message);
+    return { jsonrpc: '2.0', id: id !== undefined ? id : null, error: { code: -32000, message: err.message } };
   }
 }
+
+app.post('/mcp', async (req, res) => {
+  const key = getApiKey(req);
+  if (key !== MCP_API_KEY) {
+    console.log('AUTH REJECTED. Received:', key ? key.substring(0,8)+'...' : 'none');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const acceptHeader = req.headers['accept'] || '';
+  const wantsSse = acceptHeader.includes('text/event-stream');
+  console.log('Accept header:', acceptHeader, '| SSE mode:', wantsSse);
+
+  const body = req.body;
+  console.log('Request body:', JSON.stringify(body).substring(0, 300));
+
+  // Handle batch
+  if (Array.isArray(body)) {
+    const results = [];
+    for (const msg of body) {
+      const r = await handleMessage(msg);
+      if (r !== null) results.push(r);
+    }
+    if (wantsSse) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      for (const r of results) {
+        res.write(`data: ${JSON.stringify(r)}\n\n`);
+      }
+      return res.end();
+    }
+    return res.json(results);
+  }
+
+  const result = await handleMessage(body);
+
+  if (result === null) {
+    return res.status(202).send();
+  }
+
+  if (wantsSse) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.write(`data: ${JSON.stringify(result)}\n\n`);
+    return res.end();
+  }
+
+  res.setHeader('Content-Type', 'application/json');
+  return res.json(result);
+});
 
 app.get('/health', (req, res) => res.json({ status: 'ok', version: '1.0.0' }));
 
