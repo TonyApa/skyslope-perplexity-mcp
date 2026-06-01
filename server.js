@@ -39,7 +39,6 @@ async function getSessionToken() {
   const authHeader = `SS ${SKYSLOPE_ACCESS_KEY}:${hmac}`;
 
   console.log('AUTH attempt - timestamp:', timestamp);
-  console.log('AUTH attempt - authHeader prefix:', authHeader.substring(0, 30));
   console.log('AUTH attempt - url:', `${SKYSLOPE_BASE_URL}/auth/login`);
 
   try {
@@ -87,11 +86,11 @@ async function skyslopeGet(path, params = {}) {
 const tools = [
   {
     name: 'list_transactions',
-    description: 'List SkySlope transactions (listings and sales files)',
+    description: 'List all SkySlope real estate transactions and listing files. Use this tool to get active, closed, or all transactions for the user.',
     inputSchema: {
       type: 'object',
       properties: {
-        status: { type: 'string', description: 'Filter by status: active, closed, all', enum: ['active', 'closed', 'all'] },
+        status: { type: 'string', description: 'Filter by status: active, closed, all (default: active)', enum: ['active', 'closed', 'all'] },
         limit: { type: 'number', description: 'Max number of results (default 25)' },
         offset: { type: 'number', description: 'Pagination offset' }
       }
@@ -99,7 +98,7 @@ const tools = [
   },
   {
     name: 'get_listing_file',
-    description: 'Get details of a specific SkySlope listing file by ID',
+    description: 'Get full details of a specific SkySlope listing file by its ID, including property address, parties, and status.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -110,7 +109,7 @@ const tools = [
   },
   {
     name: 'missing_documents_report',
-    description: 'Get a report of missing or incomplete documents for a transaction',
+    description: 'Get a report of missing or incomplete documents and checklist items for a specific SkySlope transaction.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -121,7 +120,7 @@ const tools = [
   },
   {
     name: 'transaction_summary',
-    description: 'Get a summary of a SkySlope transaction including parties, dates, and status',
+    description: 'Get a complete summary of a SkySlope transaction including all parties (buyer, seller, agents), important dates, and current status.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -155,12 +154,12 @@ async function callTool(name, args) {
 app.post('/mcp', async (req, res) => {
   const key = getApiKey(req);
   if (key !== MCP_API_KEY) {
-    console.log('AUTH REJECTED - key mismatch. Got:', key ? key.substring(0,10)+'...' : 'empty');
+    console.log('AUTH REJECTED - key mismatch');
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
   const { jsonrpc, id, method, params } = req.body;
-  console.log('MCP method:', method);
+  console.log('MCP method:', method, '| id:', id);
 
   try {
     if (method === 'initialize') {
@@ -172,6 +171,11 @@ app.post('/mcp', async (req, res) => {
           serverInfo: { name: 'skyslope-mcp', version: '1.0.0' }
         }
       });
+    }
+
+    // Handle notifications - return empty success (no id for notifications)
+    if (method && method.startsWith('notifications/')) {
+      return res.status(200).json({ jsonrpc: '2.0' });
     }
 
     if (method === 'tools/list') {
