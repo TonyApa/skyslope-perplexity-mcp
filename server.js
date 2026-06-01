@@ -19,7 +19,7 @@ const sessions = new Map();
 
 function getApiKey(req) {
     return req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ','') || req.query.api_key || req.headers['api-key'];
-
+}
 function skyslopeHeaders() {
   if (SKYSLOPE_AUTH_MODE === 'basic') {
     const encoded = Buffer.from(`${SKYSLOPE_ACCESS_KEY}:${SKYSLOPE_SECRET_KEY}`).toString('base64');
