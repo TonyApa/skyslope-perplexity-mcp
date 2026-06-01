@@ -29,18 +29,13 @@ async function getSessionToken() {
   if (sessionToken && sessionTokenExpiry && Date.now() < sessionTokenExpiry - 300000) {
     return sessionToken;
   }
-
   const timestamp = new Date().toISOString();
   const input = `${SKYSLOPE_CLIENT_ID}:${SKYSLOPE_CLIENT_SECRET}:${timestamp}`;
   const hmac = crypto.createHmac('sha256', SKYSLOPE_SECRET_KEY)
     .update(input)
     .digest('base64');
-
   const authHeader = `SS ${SKYSLOPE_ACCESS_KEY}:${hmac}`;
-
   console.log('AUTH attempt - timestamp:', timestamp);
-  console.log('AUTH attempt - url:', `${SKYSLOPE_BASE_URL}/auth/login`);
-
   try {
     const response = await axios.post(`${SKYSLOPE_BASE_URL}/auth/login`, {
       clientID: SKYSLOPE_CLIENT_ID,
@@ -52,10 +47,7 @@ async function getSessionToken() {
         'Timestamp': timestamp
       }
     });
-
     console.log('AUTH success - status:', response.status);
-    console.log('AUTH success - data keys:', Object.keys(response.data || {}));
-
     const token = response.data.token || response.data.sessionToken || response.data.access_token || response.data;
     sessionToken = typeof token === 'string' ? token : JSON.stringify(token);
     sessionTokenExpiry = Date.now() + 2 * 60 * 60 * 1000;
@@ -65,14 +57,12 @@ async function getSessionToken() {
     const errStatus = err.response?.status;
     console.error('AUTH FAILED - status:', errStatus);
     console.error('AUTH FAILED - data:', JSON.stringify(errData));
-    console.error('AUTH FAILED - message:', err.message);
     throw new Error(`SkySlope auth failed (${errStatus}): ${JSON.stringify(errData)}`);
   }
 }
 
 async function skyslopeGet(path, params = {}) {
   const token = await getSessionToken();
-  console.log('API GET:', `${SKYSLOPE_BASE_URL}${path}`);
   const response = await axios.get(`${SKYSLOPE_BASE_URL}${path}`, {
     headers: {
       'Authorization': `Bearer ${token}`,
@@ -83,22 +73,23 @@ async function skyslopeGet(path, params = {}) {
   return response.data;
 }
 
-const tools = [
+const TOOLS = [
   {
     name: 'list_transactions',
-    description: 'List all SkySlope real estate transactions and listing files. Use this tool to get active, closed, or all transactions for the user.',
+    description: 'List all SkySlope real estate transactions. Returns active, closed, or all transactions.',
     inputSchema: {
       type: 'object',
       properties: {
-        status: { type: 'string', description: 'Filter by status: active, closed, all (default: active)', enum: ['active', 'closed', 'all'] },
+        status: { type: 'string', description: 'Filter by status: active, closed, all', enum: ['active', 'closed', 'all'] },
         limit: { type: 'number', description: 'Max number of results (default 25)' },
         offset: { type: 'number', description: 'Pagination offset' }
-      }
+      },
+      required: []
     }
   },
   {
     name: 'get_listing_file',
-    description: 'Get full details of a specific SkySlope listing file by its ID, including property address, parties, and status.',
+    description: 'Get full details of a specific SkySlope listing file by its ID.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -109,7 +100,7 @@ const tools = [
   },
   {
     name: 'missing_documents_report',
-    description: 'Get a report of missing or incomplete documents and checklist items for a specific SkySlope transaction.',
+    description: 'Get a report of missing or incomplete documents for a specific SkySlope transaction.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -120,7 +111,7 @@ const tools = [
   },
   {
     name: 'transaction_summary',
-    description: 'Get a complete summary of a SkySlope transaction including all parties (buyer, seller, agents), important dates, and current status.',
+    description: 'Get a complete summary of a SkySlope transaction including parties, dates, and status.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -151,60 +142,103 @@ async function callTool(name, args) {
   throw new Error(`Unknown tool: ${name}`);
 }
 
+function jsonrpcError(id, code, message) {
+  return { jsonrpc: '2.0', id: id !== undefined ? id : null, error: { code, message } };
+}
+
 app.post('/mcp', async (req, res) => {
   const key = getApiKey(req);
   if (key !== MCP_API_KEY) {
-    console.log('AUTH REJECTED - key mismatch');
+    console.log('AUTH REJECTED - key mismatch. Received:', key ? key.substring(0,8)+'...' : 'none');
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const { jsonrpc, id, method, params } = req.body;
+  const body = req.body;
+  console.log('MCP request body:', JSON.stringify(body).substring(0, 200));
+
+  // Handle batch requests
+  if (Array.isArray(body)) {
+    const results = [];
+    for (const msg of body) {
+      const r = await handleMessage(msg);
+      if (r !== null) results.push(r);
+    }
+    return res.json(results);
+  }
+
+  const result = await handleMessage(body);
+  if (result === null) {
+    // Notification - no response body
+    return res.status(204).send();
+  }
+  return res.json(result);
+});
+
+async function handleMessage(msg) {
+  const { jsonrpc, id, method, params } = msg;
   console.log('MCP method:', method, '| id:', id);
+
+  // Notifications have no id - return null (no response)
+  const isNotification = id === undefined || id === null;
 
   try {
     if (method === 'initialize') {
-      return res.json({
-        jsonrpc: '2.0', id,
+      return {
+        jsonrpc: '2.0',
+        id,
         result: {
           protocolVersion: '2024-11-05',
-          capabilities: { tools: {} },
+          capabilities: { tools: { listChanged: false } },
           serverInfo: { name: 'skyslope-mcp', version: '1.0.0' }
         }
-      });
+      };
     }
 
-    // Handle notifications - return empty success (no id for notifications)
-    if (method && method.startsWith('notifications/')) {
-      return res.status(200).json({ jsonrpc: '2.0' });
+    if (method === 'notifications/initialized' || (method && method.startsWith('notifications/'))) {
+      return null; // No response for notifications
     }
 
     if (method === 'tools/list') {
-      return res.json({ jsonrpc: '2.0', id, result: { tools } });
+      return { jsonrpc: '2.0', id, result: { tools: TOOLS } };
     }
 
     if (method === 'tools/call') {
-      const { name, arguments: args } = params;
-      console.log('Calling tool:', name, 'with args:', JSON.stringify(args));
-      const result = await callTool(name, args || {});
-      return res.json({
-        jsonrpc: '2.0', id,
-        result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-      });
+      const toolName = params && params.name;
+      const toolArgs = (params && params.arguments) || {};
+      console.log('Calling tool:', toolName, 'with args:', JSON.stringify(toolArgs));
+      const data = await callTool(toolName, toolArgs);
+      return {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
+          isError: false
+        }
+      };
     }
 
-    return res.json({
-      jsonrpc: '2.0', id,
-      error: { code: -32601, message: 'Method not found' }
-    });
-  } catch (err) {
-    console.error('Tool error:', err.message);
-    return res.json({
-      jsonrpc: '2.0', id,
-      error: { code: -32000, message: err.message, data: err.response?.data }
-    });
-  }
-});
+    if (method === 'ping') {
+      return { jsonrpc: '2.0', id, result: {} };
+    }
 
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+    return jsonrpcError(id, -32601, `Method not found: ${method}`);
+
+  } catch (err) {
+    console.error('Handler error:', err.message);
+    if (isNotification) return null;
+    return jsonrpcError(id, -32000, err.message);
+  }
+}
+
+app.get('/health', (req, res) => res.json({ status: 'ok', version: '1.0.0' }));
+
+app.get('/mcp', (req, res) => {
+  res.json({
+    name: 'skyslope-mcp',
+    version: '1.0.0',
+    description: 'SkySlope MCP Server for Perplexity',
+    capabilities: ['tools']
+  });
+});
 
 app.listen(PORT, () => console.log(`SkySlope MCP server running on port ${PORT}`));
