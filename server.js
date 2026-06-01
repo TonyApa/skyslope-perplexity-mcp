@@ -18,7 +18,7 @@ const SKYSLOPE_AUTH_MODE = process.env.SKYSLOPE_AUTH_MODE || 'basic';
 const sessions = new Map();
 
 function getApiKey(req) {
-  return req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ','') || req.query.api_key;
+  return req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ','') || req.query.api_key; || req.headers['api-key']
 }
 
 function skyslopeHeaders() {
