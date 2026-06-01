@@ -16,7 +16,6 @@ const SKYSLOPE_CLIENT_ID = process.env.SKYSLOPE_CLIENT_ID;
 const SKYSLOPE_CLIENT_SECRET = process.env.SKYSLOPE_CLIENT_SECRET;
 const SKYSLOPE_BASE_URL = process.env.SKYSLOPE_BASE_URL || 'https://api.skyslope.com';
 
-// Cache session token
 let sessionToken = null;
 let sessionTokenExpiry = null;
 
@@ -27,36 +26,54 @@ function getApiKey(req) {
 }
 
 async function getSessionToken() {
-  // Return cached token if still valid (with 5 min buffer)
   if (sessionToken && sessionTokenExpiry && Date.now() < sessionTokenExpiry - 300000) {
     return sessionToken;
   }
 
   const timestamp = new Date().toISOString();
+  const input = `${SKYSLOPE_CLIENT_ID}:${SKYSLOPE_CLIENT_SECRET}:${timestamp}`;
   const hmac = crypto.createHmac('sha256', SKYSLOPE_SECRET_KEY)
-    .update(`${SKYSLOPE_CLIENT_ID}:${SKYSLOPE_CLIENT_SECRET}:${timestamp}`)
+    .update(input)
     .digest('base64');
 
   const authHeader = `SS ${SKYSLOPE_ACCESS_KEY}:${hmac}`;
 
-  const response = await axios.post(`${SKYSLOPE_BASE_URL}/auth/login`, {
-    clientID: SKYSLOPE_CLIENT_ID,
-    clientSecret: SKYSLOPE_CLIENT_SECRET
-  }, {
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': authHeader,
-      'Timestamp': timestamp
-    }
-  });
+  console.log('AUTH attempt - timestamp:', timestamp);
+  console.log('AUTH attempt - authHeader prefix:', authHeader.substring(0, 30));
+  console.log('AUTH attempt - url:', `${SKYSLOPE_BASE_URL}/auth/login`);
 
-  sessionToken = response.data.token || response.data.sessionToken || response.data;
-  sessionTokenExpiry = Date.now() + 2 * 60 * 60 * 1000; // 2 hours
-  return sessionToken;
+  try {
+    const response = await axios.post(`${SKYSLOPE_BASE_URL}/auth/login`, {
+      clientID: SKYSLOPE_CLIENT_ID,
+      clientSecret: SKYSLOPE_CLIENT_SECRET
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': authHeader,
+        'Timestamp': timestamp
+      }
+    });
+
+    console.log('AUTH success - status:', response.status);
+    console.log('AUTH success - data keys:', Object.keys(response.data || {}));
+
+    const token = response.data.token || response.data.sessionToken || response.data.access_token || response.data;
+    sessionToken = typeof token === 'string' ? token : JSON.stringify(token);
+    sessionTokenExpiry = Date.now() + 2 * 60 * 60 * 1000;
+    return sessionToken;
+  } catch (err) {
+    const errData = err.response?.data;
+    const errStatus = err.response?.status;
+    console.error('AUTH FAILED - status:', errStatus);
+    console.error('AUTH FAILED - data:', JSON.stringify(errData));
+    console.error('AUTH FAILED - message:', err.message);
+    throw new Error(`SkySlope auth failed (${errStatus}): ${JSON.stringify(errData)}`);
+  }
 }
 
 async function skyslopeGet(path, params = {}) {
   const token = await getSessionToken();
+  console.log('API GET:', `${SKYSLOPE_BASE_URL}${path}`);
   const response = await axios.get(`${SKYSLOPE_BASE_URL}${path}`, {
     headers: {
       'Authorization': `Bearer ${token}`,
@@ -67,7 +84,6 @@ async function skyslopeGet(path, params = {}) {
   return response.data;
 }
 
-// MCP Tools definition
 const tools = [
   {
     name: 'list_transactions',
@@ -136,14 +152,15 @@ async function callTool(name, args) {
   throw new Error(`Unknown tool: ${name}`);
 }
 
-// MCP JSON-RPC endpoint
 app.post('/mcp', async (req, res) => {
   const key = getApiKey(req);
   if (key !== MCP_API_KEY) {
+    console.log('AUTH REJECTED - key mismatch. Got:', key ? key.substring(0,10)+'...' : 'empty');
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
   const { jsonrpc, id, method, params } = req.body;
+  console.log('MCP method:', method);
 
   try {
     if (method === 'initialize') {
@@ -163,6 +180,7 @@ app.post('/mcp', async (req, res) => {
 
     if (method === 'tools/call') {
       const { name, arguments: args } = params;
+      console.log('Calling tool:', name, 'with args:', JSON.stringify(args));
       const result = await callTool(name, args || {});
       return res.json({
         jsonrpc: '2.0', id,
@@ -175,7 +193,7 @@ app.post('/mcp', async (req, res) => {
       error: { code: -32601, message: 'Method not found' }
     });
   } catch (err) {
-    console.error('Tool error:', err.response?.data || err.message);
+    console.error('Tool error:', err.message);
     return res.json({
       jsonrpc: '2.0', id,
       error: { code: -32000, message: err.message, data: err.response?.data }
