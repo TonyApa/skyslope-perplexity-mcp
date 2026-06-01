@@ -5,7 +5,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: '*', methods: ['GET','POST','OPTIONS'], allowedHeaders: ['*'] }));
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
@@ -15,10 +15,12 @@ const SKYSLOPE_SECRET_KEY = process.env.SKYSLOPE_SECRET_KEY;
 const SKYSLOPE_BASE_URL = process.env.SKYSLOPE_BASE_URL || 'https://api.skyslope.com';
 const SKYSLOPE_AUTH_MODE = process.env.SKYSLOPE_AUTH_MODE || 'basic';
 
-// SSE client sessions
 const sessions = new Map();
 
-// SkySlope HTTP client
+function getApiKey(req) {
+  return req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ','') || req.query.api_key;
+}
+
 function skyslopeHeaders() {
   if (SKYSLOPE_AUTH_MODE === 'basic') {
     const encoded = Buffer.from(`${SKYSLOPE_ACCESS_KEY}:${SKYSLOPE_SECRET_KEY}`).toString('base64');
@@ -28,188 +30,124 @@ function skyslopeHeaders() {
 }
 
 async function skyslopeGet(path, params = {}) {
-  const url = `${SKYSLOPE_BASE_URL}${path}`;
-  const response = await axios.get(url, { headers: skyslopeHeaders(), params });
+  const response = await axios.get(`${SKYSLOPE_BASE_URL}${path}`, { headers: skyslopeHeaders(), params });
   return response.data;
 }
 
-// MCP Tool definitions
 const TOOLS = [
-  {
-    name: 'list_transactions',
-    description: 'List SkySlope transactions for Oregon Life Property Group. Filter by status (open/pending/closed/all), agent name, office name, start date, end date, and limit.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        status: { type: 'string', enum: ['open', 'pending', 'closed', 'all'], default: 'all' },
-        agent_name: { type: 'string' },
-        office_name: { type: 'string' },
-        start_date: { type: 'string', description: 'YYYY-MM-DD' },
-        end_date: { type: 'string', description: 'YYYY-MM-DD' },
-        limit: { type: 'integer', minimum: 1, maximum: 100, default: 25 }
-      }
-    }
-  },
-  {
-    name: 'get_listing_file',
-    description: 'Get a SkySlope listing or sale file and document metadata by file ID or property address.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        file_id: { type: 'string' },
-        address: { type: 'string' }
-      }
-    }
-  },
-  {
-    name: 'missing_documents_report',
-    description: 'Return a report of missing compliance documents for a SkySlope transaction file.',
-    inputSchema: {
-      type: 'object',
-      required: ['file_id'],
-      properties: {
-        file_id: { type: 'string' },
-        transaction_type: { type: 'string', enum: ['listing', 'buyer_sale', 'seller_sale'] }
-      }
-    }
-  },
-  {
-    name: 'transaction_summary',
-    description: 'Get a full summary of a SkySlope transaction including participants, timeline, prices, status, and documents.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        file_id: { type: 'string' },
-        include_doc_list: { type: 'boolean', default: true }
-      }
-    }
-  }
+  { name: 'list_transactions', description: 'List SkySlope transactions for Oregon Life Property Group filtered by status, agent, office, date range.', inputSchema: { type: 'object', properties: { status: { type: 'string', enum: ['open','pending','closed','all'] }, agent_name: { type: 'string' }, start_date: { type: 'string' }, end_date: { type: 'string' }, limit: { type: 'integer' } } } },
+  { name: 'get_listing_file', description: 'Get a SkySlope listing or sale file by file ID or property address.', inputSchema: { type: 'object', properties: { file_id: { type: 'string' }, address: { type: 'string' } } } },
+  { name: 'missing_documents_report', description: 'Report missing compliance documents for a SkySlope transaction file.', inputSchema: { type: 'object', required: ['file_id'], properties: { file_id: { type: 'string' }, transaction_type: { type: 'string' } } } },
+  { name: 'transaction_summary', description: 'Full summary of a SkySlope transaction including participants, timeline, prices, documents.', inputSchema: { type: 'object', properties: { file_id: { type: 'string' }, include_doc_list: { type: 'boolean' } } } }
 ];
 
-// Tool implementations
 async function callTool(name, args = {}) {
-  switch (name) {
-    case 'list_transactions': return await listTransactions(args);
-    case 'get_listing_file': return await getListingFile(args);
-    case 'missing_documents_report': return await missingDocumentsReport(args);
-    case 'transaction_summary': return await transactionSummary(args);
-    default: throw new Error(`Unknown tool: ${name}`);
+  if (name === 'list_transactions') {
+    const p = {};
+    if (args.status && args.status !== 'all') p.status = args.status;
+    if (args.agent_name) p.agentName = args.agent_name;
+    if (args.start_date) p.startDate = args.start_date;
+    if (args.end_date) p.endDate = args.end_date;
+    if (args.limit) p.limit = args.limit;
+    return await skyslopeGet('/v1/transactions', p);
   }
-}
-
-async function listTransactions(args = {}) {
-  const params = {};
-  if (args.status && args.status !== 'all') params.status = args.status;
-  if (args.agent_name) params.agentName = args.agent_name;
-  if (args.office_name) params.officeName = args.office_name;
-  if (args.start_date) params.startDate = args.start_date;
-  if (args.end_date) params.endDate = args.end_date;
-  if (args.limit) params.limit = args.limit;
-  return await skyslopeGet('/v1/transactions', params);
-}
-
-async function getListingFile(args = {}) {
-  if (args.file_id) return await skyslopeGet(`/v1/transactions/${args.file_id}`);
-  if (args.address) return await skyslopeGet('/v1/transactions', { address: args.address, limit: 1 });
-  throw new Error('Provide file_id or address');
-}
-
-async function missingDocumentsReport(args = {}) {
-  const file = await skyslopeGet(`/v1/transactions/${args.file_id}`);
-  const docs = await skyslopeGet(`/v1/transactions/${args.file_id}/documents`);
-  const uploaded = (docs.documents || []).map(d => d.name?.toLowerCase());
-  const required = requiredDocs(args.transaction_type || file.transactionType);
-  const missing = required.filter(r => !uploaded.some(u => u && u.includes(r.toLowerCase())));
-  return { file_id: args.file_id, address: file.address || file.propertyAddress, status: file.status, agent: file.agentName, missing_documents: missing, uploaded_count: uploaded.length };
-}
-
-async function transactionSummary(args = {}) {
-  const id = args.file_id;
-  if (!id) throw new Error('Provide file_id');
-  const file = await skyslopeGet(`/v1/transactions/${id}`);
-  const docs = args.include_doc_list !== false ? await skyslopeGet(`/v1/transactions/${id}/documents`) : { documents: [] };
-  return { file_id: id, address: file.address || file.propertyAddress, status: file.status, transaction_type: file.transactionType, agent: file.agentName, office: file.officeName, buyers: file.buyers || [], sellers: file.sellers || [], list_date: file.listDate, close_date: file.closeDate, list_price: file.listPrice, sale_price: file.salePrice, documents: (docs.documents || []).map(d => ({ name: d.name, status: d.status })) };
-}
-
-function requiredDocs(type) {
-  const base = ['Purchase Agreement', 'Agency Disclosure', 'Lead Paint Disclosure'];
-  if (type === 'listing') return [...base, 'Listing Agreement', 'Seller Disclosure'];
-  if (type === 'buyer_sale') return [...base, 'Buyer Representation Agreement', 'Final Settlement Statement'];
-  return [...base, 'Seller Disclosure', 'Final Settlement Statement'];
-}
-
-// MCP JSON-RPC handler
-async function handleMcpRequest(body) {
-  const { jsonrpc, id, method, params } = body;
-  try {
-    if (method === 'initialize') {
-      return { jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'skyslope-mcp', version: '1.0.0' } } };
-    }
-    if (method === 'tools/list') {
-      return { jsonrpc: '2.0', id, result: { tools: TOOLS } };
-    }
-    if (method === 'tools/call') {
-      const result = await callTool(params.name, params.arguments || {});
-      return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] } };
-    }
-    if (method === 'notifications/initialized') {
-      return null;
-    }
-    return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } };
-  } catch (err) {
-    return { jsonrpc: '2.0', id, error: { code: -32603, message: err.message } };
+  if (name === 'get_listing_file') {
+    if (args.file_id) return await skyslopeGet(`/v1/transactions/${args.file_id}`);
+    if (args.address) return await skyslopeGet('/v1/transactions', { address: args.address, limit: 1 });
+    throw new Error('Provide file_id or address');
   }
+  if (name === 'missing_documents_report') {
+    const file = await skyslopeGet(`/v1/transactions/${args.file_id}`);
+    const docs = await skyslopeGet(`/v1/transactions/${args.file_id}/documents`);
+    const uploaded = (docs.documents||[]).map(d=>d.name?.toLowerCase());
+    const base = ['Purchase Agreement','Agency Disclosure','Lead Paint Disclosure'];
+    const required = args.transaction_type === 'listing' ? [...base,'Listing Agreement','Seller Disclosure'] : [...base,'Seller Disclosure','Final Settlement Statement'];
+    return { file_id: args.file_id, address: file.address||file.propertyAddress, status: file.status, agent: file.agentName, missing_documents: required.filter(r=>!uploaded.some(u=>u&&u.includes(r.toLowerCase()))), uploaded_count: uploaded.length };
+  }
+  if (name === 'transaction_summary') {
+    const file = await skyslopeGet(`/v1/transactions/${args.file_id}`);
+    const docs = args.include_doc_list !== false ? await skyslopeGet(`/v1/transactions/${args.file_id}/documents`) : { documents: [] };
+    return { file_id: args.file_id, address: file.address||file.propertyAddress, status: file.status, agent: file.agentName, office: file.officeName, list_price: file.listPrice, sale_price: file.salePrice, list_date: file.listDate, close_date: file.closeDate, documents: (docs.documents||[]).map(d=>({name:d.name,status:d.status})) };
+  }
+  throw new Error(`Unknown tool: ${name}`);
 }
 
-// Health check
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'skyslope-perplexity-mcp', version: '1.0.0' }));
+async function handleJsonRpc(body) {
+  const { id, method, params } = body;
+  if (method === 'initialize') return { jsonrpc:'2.0', id, result: { protocolVersion:'2024-11-05', capabilities:{ tools:{} }, serverInfo:{ name:'skyslope-mcp', version:'1.0.0' } } };
+  if (method === 'notifications/initialized') return null;
+  if (method === 'ping') return { jsonrpc:'2.0', id, result:{} };
+  if (method === 'tools/list') return { jsonrpc:'2.0', id, result:{ tools: TOOLS } };
+  if (method === 'tools/call') {
+    try {
+      const result = await callTool(params.name, params.arguments||{});
+      return { jsonrpc:'2.0', id, result:{ content:[{ type:'text', text: JSON.stringify(result,null,2) }] } };
+    } catch(e) {
+      return { jsonrpc:'2.0', id, error:{ code:-32603, message: e.message } };
+    }
+  }
+  return { jsonrpc:'2.0', id, error:{ code:-32601, message:`Method not found: ${method}` } };
+}
 
-// SSE endpoint - MCP over SSE transport
-app.get('/sse', (req, res) => {
-  const apiKey = req.headers['x-api-key'] || req.query.api_key;
-  if (apiKey !== MCP_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+app.get('/health', (req,res) => res.json({ status:'ok', service:'skyslope-perplexity-mcp', version:'1.0.0' }));
 
+// Streamable HTTP MCP endpoint (POST)
+app.post('/mcp', async (req,res) => {
+  const key = getApiKey(req);
+  if (key !== MCP_API_KEY) return res.status(401).json({ error:'Unauthorized' });
+
+  const accept = req.headers['accept'] || '';
+  const wantsStream = accept.includes('text/event-stream');
+
+  const response = await handleJsonRpc(req.body);
+
+  if (wantsStream) {
+    res.setHeader('Content-Type','text/event-stream');
+    res.setHeader('Cache-Control','no-cache');
+    res.setHeader('Connection','keep-alive');
+    if (response) res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
+    res.end();
+  } else {
+    res.setHeader('Content-Type','application/json');
+    if (response) res.json(response);
+    else res.status(204).end();
+  }
+});
+
+// GET /mcp for Streamable HTTP session init
+app.get('/mcp', (req,res) => {
+  const key = getApiKey(req);
+  if (key !== MCP_API_KEY) return res.status(401).json({ error:'Unauthorized' });
+  res.setHeader('Content-Type','text/event-stream');
+  res.setHeader('Cache-Control','no-cache');
+  res.setHeader('Connection','keep-alive');
   const sessionId = crypto.randomUUID();
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-
-  // Send endpoint event with POST URL for this session
-  const postUrl = `/messages?sessionId=${sessionId}`;
-  res.write(`event: endpoint\ndata: ${JSON.stringify(postUrl)}\n\n`);
-
   sessions.set(sessionId, res);
-
+  res.write(`event: endpoint\ndata: "/mcp?sessionId=${sessionId}"\n\n`);
   req.on('close', () => sessions.delete(sessionId));
 });
 
-// Messages endpoint - receives JSON-RPC from client
-app.post('/messages', async (req, res) => {
-  const apiKey = req.headers['x-api-key'] || req.query.api_key;
-  if (apiKey !== MCP_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
-
-  const sessionId = req.query.sessionId;
-  const sseRes = sessions.get(sessionId);
-  if (!sseRes) return res.status(400).json({ error: 'Session not found' });
-
-  res.status(202).send('Accepted');
-
-  const response = await handleMcpRequest(req.body);
-  if (response) {
-    sseRes.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
-  }
+// SSE endpoint
+app.get('/sse', (req,res) => {
+  const key = getApiKey(req);
+  if (key !== MCP_API_KEY) return res.status(401).json({ error:'Unauthorized' });
+  const sessionId = crypto.randomUUID();
+  res.setHeader('Content-Type','text/event-stream');
+  res.setHeader('Cache-Control','no-cache');
+  res.setHeader('Connection','keep-alive');
+  sessions.set(sessionId, res);
+  res.write(`event: endpoint\ndata: "/messages?sessionId=${sessionId}"\n\n`);
+  req.on('close', () => sessions.delete(sessionId));
 });
 
-// Streamable HTTP endpoint
-app.post('/mcp', async (req, res) => {
-  const apiKey = req.headers['x-api-key'] || req.query.api_key;
-  if (apiKey !== MCP_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
-
-  res.setHeader('Content-Type', 'application/json');
-  const response = await handleMcpRequest(req.body);
-  if (response) res.json(response);
-  else res.status(204).send();
+app.post('/messages', async (req,res) => {
+  const key = getApiKey(req);
+  if (key !== MCP_API_KEY) return res.status(401).json({ error:'Unauthorized' });
+  const sseRes = sessions.get(req.query.sessionId);
+  if (!sseRes) return res.status(400).json({ error:'Session not found' });
+  res.status(202).end();
+  const response = await handleJsonRpc(req.body);
+  if (response) sseRes.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
 });
 
-app.listen(PORT, () => console.log(`SkySlope MCP server running on port ${PORT} (SSE: /sse, HTTP: /mcp)`));
+app.listen(PORT, () => console.log(`SkySlope MCP ready on port ${PORT}`));
